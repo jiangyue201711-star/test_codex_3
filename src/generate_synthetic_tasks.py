@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate benchmark-equivalent LLM agent training tasks.
 
-Output records include ONLY:
+Each output record contains:
 - instruction
 - validation_spec
+- app_files: {"/app/task.py": ..., "/app/eval.py": ...}
 
 The generator enforces:
 - family/difficulty diversity
@@ -34,43 +35,51 @@ BANNED_KEYWORDS = {
 FAMILIES = {
     "numeric_kernel": {
         "goal": "Optimize a numerical kernel function while preserving tolerance-bound outputs.",
-        "io": "Input is a batch of float64 arrays; output is per-item scalar or vector statistics.",
+        "io": "Input is a batch of float64 arrays; output is per-item scalar statistics.",
         "pitfalls": ["catastrophic cancellation", "branch-heavy loops", "temporary allocations"],
+        "kind": "numeric",
     },
     "string_batch": {
         "goal": "Accelerate batch string/byte processing with exact matching semantics.",
-        "io": "Input is a list of byte strings and patterns; output is match counts and offsets.",
+        "io": "Input is a list of strings and tokens; output is per-token counts.",
         "pitfalls": ["quadratic scanning", "encoding edge-cases", "large intermediate objects"],
+        "kind": "discrete",
     },
     "graph_microkernel": {
         "goal": "Optimize a small graph propagation/counting micro-kernel.",
-        "io": "Input is compact adjacency data; output is per-node scores/count vectors.",
+        "io": "Input is compact adjacency list; output is per-node weighted degree proxy.",
         "pitfalls": ["sparse-dense conversion", "index bounds", "duplicate edge handling"],
+        "kind": "numeric",
     },
     "dp_operator": {
         "goal": "Improve throughput of a bounded dynamic-programming operator.",
-        "io": "Input is short sequences with constraints; output is cost/path summary.",
+        "io": "Input is short integer sequences; output is longest non-decreasing run length.",
         "pitfalls": ["state explosion", "poor cache locality", "incorrect base-case handling"],
+        "kind": "discrete",
     },
     "geometry_batch": {
         "goal": "Optimize batched geometric predicate computation.",
-        "io": "Input is point/box collections; output is boolean masks and aggregate counts.",
+        "io": "Input is point pairs; output is Euclidean distance summaries.",
         "pitfalls": ["floating-point tolerance", "degenerate geometry", "O(n^2) checks"],
+        "kind": "numeric",
     },
     "prob_sampling": {
-        "goal": "Optimize a probabilistic sampling/evaluation step.",
-        "io": "Input is probability tables and seeds; output is sampled indices and diagnostics.",
+        "goal": "Optimize a probabilistic normalization/evaluation step.",
+        "io": "Input is non-negative score vectors; output is normalized vectors.",
         "pitfalls": ["normalization drift", "seed misuse", "biased sampling shortcuts"],
+        "kind": "numeric",
     },
     "etl_transform": {
         "goal": "Accelerate ETL-style normalization and feature transformation.",
-        "io": "Input is tabular rows with mixed missing values; output is normalized feature blocks.",
+        "io": "Input is numeric table with missing values; output is z-score-like normalization.",
         "pitfalls": ["datetime parsing cost", "null handling", "type instability"],
+        "kind": "numeric",
     },
     "dsl_executor": {
         "goal": "Optimize execution of a tiny fixed-grammar DSL interpreter core.",
-        "io": "Input is tokenized instructions and registers; output is final register snapshot.",
+        "io": "Input is op string list; output is accumulator trajectory checksum.",
         "pitfalls": ["dispatch overhead", "state mutation bugs", "unchecked opcode paths"],
+        "kind": "discrete",
     },
 }
 
@@ -91,6 +100,7 @@ class TaskRecord:
     difficulty: str
     instruction: str
     validation_spec: Dict
+    app_files: Dict[str, str]
 
 
 def build_instruction(family: str, difficulty: str, rng: random.Random) -> str:
@@ -116,8 +126,8 @@ def build_validation_spec(family: str, difficulty: str, rng: random.Random) -> D
             "deterministic_tests": 24 + 4 * (difficulty in {"L3", "L4"}),
             "randomized_tests": 32 + 8 * (difficulty in {"L3", "L4"}),
             "numeric_tolerance": {
-                "abs_err": 1e-8 if family in {"numeric_kernel", "geometry_batch", "prob_sampling"} else 0.0,
-                "rel_err": 1e-6 if family in {"numeric_kernel", "geometry_batch", "prob_sampling"} else 0.0,
+                "abs_err": 1e-8 if FAMILIES[family]["kind"] == "numeric" else 0.0,
+                "rel_err": 1e-6 if FAMILIES[family]["kind"] == "numeric" else 0.0,
             },
             "property_checks": [
                 "shape and dtype invariants",
@@ -145,6 +155,97 @@ def build_validation_spec(family: str, difficulty: str, rng: random.Random) -> D
     }
 
 
+def build_task_py(family: str) -> str:
+    return f'''"""Auto-generated starter for family: {family}."""
+
+from __future__ import annotations
+
+
+def solve(data):
+    """TODO: optimize this implementation in-place.
+
+    Constraints:
+    - keep function signature unchanged
+    - keep return type stable
+    """
+    # Slow baseline (intentionally loop-heavy)
+    out = []
+    for item in data:
+        if isinstance(item, (list, tuple)):
+            s = 0.0
+            for x in item:
+                s += float(x)
+            out.append(s)
+        elif isinstance(item, str):
+            out.append(float(len(item.split())))
+        else:
+            out.append(float(item) if item is not None else 0.0)
+    return out
+'''
+
+
+def build_eval_py(difficulty: str) -> str:
+    alpha = DIFFICULTY[difficulty]["alpha"]
+    return f'''"""Auto-generated evaluator template."""
+
+from __future__ import annotations
+
+import statistics
+import time
+
+
+def reference_solve(data):
+    # Deliberately simple and usually slower than an optimized vectorized solution.
+    out = []
+    for item in data:
+        if isinstance(item, (list, tuple)):
+            total = 0.0
+            for x in item:
+                total += float(x)
+            out.append(total)
+        elif isinstance(item, str):
+            out.append(float(len(item.split())))
+        else:
+            out.append(float(item) if item is not None else 0.0)
+    return out
+
+
+def check_correctness(candidate_fn, dataset):
+    ref = reference_solve(dataset)
+    got = candidate_fn(dataset)
+    if len(ref) != len(got):
+        return False
+    return all(abs(a - b) <= 1e-8 for a, b in zip(ref, got))
+
+
+def median_runtime(fn, dataset, repeats=80):
+    costs = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(dataset)
+        costs.append(time.perf_counter() - t0)
+    return statistics.median(costs)
+
+
+def evaluate(candidate_fn, dataset):
+    ok = check_correctness(candidate_fn, dataset)
+    if not ok:
+        return {{"passed": False, "reason": "correctness"}}
+
+    c = median_runtime(candidate_fn, dataset)
+    r = median_runtime(reference_solve, dataset)
+    perf_ok = c <= {alpha} * r
+    return {{"passed": bool(perf_ok), "candidate": c, "reference": r, "alpha": {alpha}}}
+'''
+
+
+def build_app_files(family: str, difficulty: str) -> Dict[str, str]:
+    return {
+        "/app/task.py": build_task_py(family),
+        "/app/eval.py": build_eval_py(difficulty),
+    }
+
+
 def contains_banned_phrase(text: str) -> bool:
     low = text.lower()
     return any(k in low for k in BANNED_KEYWORDS)
@@ -168,11 +269,10 @@ def jaccard_ngrams(a: str, b: str, n: int = 3) -> float:
 
 
 def build_difficulty_schedule(total: int) -> List[str]:
-    bucket = []
+    bucket: List[str] = []
     for name, weight in TARGET_RATIO:
         bucket.extend([name] * weight)
-    schedule = [bucket[i % len(bucket)] for i in range(total)]
-    return schedule
+    return [bucket[i % len(bucket)] for i in range(total)]
 
 
 def generate_records(count: int, seed: int) -> List[TaskRecord]:
@@ -185,21 +285,20 @@ def generate_records(count: int, seed: int) -> List[TaskRecord]:
         family = families[i % len(families)]
         difficulty = schedule[i]
         instruction = build_instruction(family, difficulty, rng)
+
         if contains_banned_phrase(instruction):
             raise ValueError("Generated instruction violated anti-contamination keyword policy.")
 
-        spec = build_validation_spec(family, difficulty, rng)
         rec = TaskRecord(
             id=str(uuid.uuid4()),
             family=family,
             difficulty=difficulty,
             instruction=instruction,
-            validation_spec=spec,
+            validation_spec=build_validation_spec(family, difficulty, rng),
+            app_files=build_app_files(family, difficulty),
         )
 
-        # Lightweight near-duplicate filter.
         if any(jaccard_ngrams(rec.instruction, prev.instruction) > 0.88 for prev in records):
-            # retry one time with a different family/pitfall sample
             family = rng.choice(families)
             instruction = build_instruction(family, difficulty, rng)
             rec = TaskRecord(
@@ -208,6 +307,7 @@ def generate_records(count: int, seed: int) -> List[TaskRecord]:
                 difficulty=difficulty,
                 instruction=instruction,
                 validation_spec=build_validation_spec(family, difficulty, rng),
+                app_files=build_app_files(family, difficulty),
             )
 
         records.append(rec)
@@ -220,6 +320,7 @@ def to_export_dict(record: TaskRecord) -> Dict:
         "id": record.id,
         "instruction": record.instruction,
         "validation_spec": record.validation_spec,
+        "app_files": record.app_files,
         "family": record.family,
         "difficulty": record.difficulty,
         "tags": ["correctness", "performance", "robustness", record.family, record.difficulty],
