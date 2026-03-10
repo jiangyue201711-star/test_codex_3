@@ -76,15 +76,40 @@ FAMILIES = {
         "kind": "discrete",
         "pitfalls": ["dispatch overhead", "opcode parsing", "state mutation bugs"],
     },
+    "bitset_ops": {
+        "goal": "Accelerate bitset intersection and popcount aggregation.",
+        "io": "Input is List[Tuple[int,int]], output is List[int] popcount(a & b).",
+        "kind": "discrete",
+        "pitfalls": ["bit twiddling overhead", "large integer ops", "branch prediction misses"],
+    },
+    "window_stats": {
+        "goal": "Optimize rolling-window average over dense vectors.",
+        "io": "Input is List[List[float]], output is List[List[float]] rolling means.",
+        "kind": "numeric",
+        "pitfalls": ["prefix sum bugs", "off-by-one window bounds", "memory churn"],
+    },
+    "trie_like_lookup": {
+        "goal": "Speed up prefix score computation for token strings.",
+        "io": "Input is List[str], output is List[int] prefix scores.",
+        "kind": "discrete",
+        "pitfalls": ["prefix matching complexity", "repeated slicing", "hash collisions"],
+    },
+    "schedule_sim": {
+        "goal": "Optimize simple queue scheduling simulation.",
+        "io": "Input is List[List[Tuple[int,int]]], output is List[int] completion times.",
+        "kind": "discrete",
+        "pitfalls": ["queue state drift", "time-step inefficiency", "edge-case starvation"],
+    },
 }
 
 DIFFICULTY = {
-    "L1": {"alpha": 0.98, "seeds": 2, "hidden_tests": 8},
-    "L2": {"alpha": 0.95, "seeds": 3, "hidden_tests": 12},
-    "L3": {"alpha": 0.90, "seeds": 4, "hidden_tests": 16},
-    "L4": {"alpha": 0.85, "seeds": 5, "hidden_tests": 20},
+    "L1": {"alpha": 0.99, "seeds": 2, "hidden_tests": 8, "timed_calls": 90},
+    "L2": {"alpha": 0.97, "seeds": 3, "hidden_tests": 12, "timed_calls": 120},
+    "L3": {"alpha": 0.94, "seeds": 4, "hidden_tests": 18, "timed_calls": 150},
+    "L4": {"alpha": 0.90, "seeds": 5, "hidden_tests": 24, "timed_calls": 180},
+    "L5": {"alpha": 0.86, "seeds": 7, "hidden_tests": 32, "timed_calls": 240},
 }
-TARGET_RATIO = [("L1", 2), ("L2", 4), ("L3", 3), ("L4", 1)]
+TARGET_RATIO = [("L1", 1), ("L2", 3), ("L3", 3), ("L4", 2), ("L5", 1)]
 
 
 @dataclass
@@ -116,21 +141,29 @@ def build_validation_spec(family: str, difficulty: str, rng: random.Random) -> D
     numeric = FAMILIES[family]["kind"] == "numeric"
     return {
         "correctness": {
-            "deterministic_tests": 24 + 4 * (difficulty in {"L3", "L4"}),
-            "randomized_tests": 32 + 8 * (difficulty in {"L3", "L4"}),
+            "deterministic_tests": 20 + 6 * (difficulty in {"L3", "L4", "L5"}) + 4 * (difficulty == "L5"),
+            "randomized_tests": 24 + 10 * (difficulty in {"L3", "L4", "L5"}) + 12 * (difficulty == "L5"),
+            "distribution_shift_tests": 0 if difficulty in {"L1", "L2"} else 6 + 6 * (difficulty in {"L4", "L5"}),
             "numeric_tolerance": {"abs_err": 1e-8 if numeric else 0.0, "rel_err": 1e-6 if numeric else 0.0},
         },
         "performance": {
             "metric": "median_time_per_call",
-            "warmup_calls": 20,
-            "timed_calls": 120,
+            "warmup_calls": 20 + 10 * (difficulty in {"L4", "L5"}),
+            "timed_calls": d["timed_calls"],
             "pass_condition": f"candidate_median <= {d['alpha']} * reference_median",
+            "cold_start_budget_ms": 90 if difficulty == "L1" else 70 if difficulty == "L2" else 55 if difficulty == "L3" else 40,
         },
         "robustness": {
             "seeds": [rng.randint(1, 10_000_000) for _ in range(d["seeds"])],
             "hidden_tests": d["hidden_tests"],
+            "adversarial_cases": 2 if difficulty == "L1" else 4 if difficulty == "L2" else 8 if difficulty == "L3" else 12,
         },
-        "anti_cheat": {"disallow_eval_introspection": True, "shuffle_input_order": True},
+        "anti_cheat": {
+            "disallow_eval_introspection": True,
+            "shuffle_input_order": True,
+            "randomize_lengths": difficulty in {"L3", "L4", "L5"},
+            "forbid_global_cache": difficulty in {"L4", "L5"},
+        },
     }
 
 
@@ -154,7 +187,7 @@ def _eval_template(family: str, alpha: float, dataset_fn: str, reference_fn: str
         'from __future__ import annotations\n\n'
         'import random\nimport statistics\nimport time\n\n'
         f'FAMILY = "{family}"\n\n'
-        'def build_dataset(seed: int, n: int = 120):\n'
+        'def build_dataset(seed: int, n: int = 140):\n'
         f"{dataset_i}\n\n"
         'def reference_solve(data):\n'
         f"{reference_i}\n\n"
@@ -166,19 +199,19 @@ def _eval_template(family: str, alpha: float, dataset_fn: str, reference_fn: str
         '        return False\n'
         '    for a, b in zip(ref, got):\n'
         '        if isinstance(a, float):\n'
-        '            if abs(a - b) > 1e-8:\n'
+        '            if abs(a - float(b)) > 1e-8:\n'
         '                return False\n'
         '        elif isinstance(a, list):\n'
         '            if len(a) != len(b):\n'
         '                return False\n'
         '            for x, y in zip(a, b):\n'
-        '                if abs(x - y) > 1e-8:\n'
+        '                if abs(float(x) - float(y)) > 1e-8:\n'
         '                    return False\n'
         '        else:\n'
         '            if a != b:\n'
         '                return False\n'
         '    return True\n\n'
-        'def median_runtime(fn, seed: int = 0, repeats: int = 80):\n'
+        'def median_runtime(fn, seed: int = 0, repeats: int = 90):\n'
         '    data = build_dataset(seed)\n'
         '    costs = []\n'
         '    for _ in range(repeats):\n'
@@ -293,6 +326,53 @@ for prog in data:
     out.append(acc)
 return out
 """,
+        "bitset_ops": """
+out = []
+for a, b in data:
+    out.append((int(a) & int(b)).bit_count())
+return out
+""",
+        "window_stats": """
+out = []
+for row in data:
+    if len(row) < 5:
+        out.append([])
+        continue
+    acc = []
+    for i in range(4, len(row)):
+        s = 0.0
+        for j in range(i - 4, i + 1):
+            s += float(row[j])
+        acc.append(s / 5.0)
+    out.append(acc)
+return out
+""",
+        "trie_like_lookup": """
+out = []
+for text in data:
+    score = 0
+    words = text.split()
+    for w in words:
+        if w.startswith('pre'):
+            score += 3
+        elif w.startswith('pro'):
+            score += 2
+        elif w.startswith('p'):
+            score += 1
+    out.append(score)
+return out
+""",
+        "schedule_sim": """
+out = []
+for jobs in data:
+    t = 0
+    for arrival, dur in jobs:
+        if t < arrival:
+            t = arrival
+        t += dur
+    out.append(t)
+return out
+""",
     }
     return _task_template(family, task_bodies[family])
 
@@ -302,20 +382,20 @@ def build_eval_py(family: str, difficulty: str) -> str:
     dataset_builders = {
         "numeric_kernel": """
 rng = random.Random(seed)
-return [[rng.uniform(-3, 3) for _ in range(32)] for _ in range(n)]
+return [[rng.uniform(-3, 3) for _ in range(36)] for _ in range(n)]
 """,
         "string_batch": """
 rng = random.Random(seed)
 vocab = ["x", "a", "b", "c", "d"]
-return [" ".join(rng.choice(vocab) for _ in range(40)) for _ in range(n)]
+return [" ".join(rng.choice(vocab) for _ in range(48)) for _ in range(n)]
 """,
         "graph_microkernel": """
 rng = random.Random(seed)
-return [[(rng.randint(0, 31), rng.randint(1, 8)) for _ in range(24)] for _ in range(n)]
+return [[(rng.randint(0, 63), rng.randint(1, 8)) for _ in range(28)] for _ in range(n)]
 """,
         "dp_operator": """
 rng = random.Random(seed)
-return [[rng.randint(0, 20) for _ in range(48)] for _ in range(n)]
+return [[rng.randint(0, 20) for _ in range(56)] for _ in range(n)]
 """,
         "geometry_batch": """
 rng = random.Random(seed)
@@ -323,124 +403,50 @@ return [((rng.uniform(-10, 10), rng.uniform(-10, 10)), (rng.uniform(-10, 10), rn
 """,
         "prob_sampling": """
 rng = random.Random(seed)
-return [[rng.random() for _ in range(16)] for _ in range(n)]
+return [[rng.random() for _ in range(20)] for _ in range(n)]
 """,
         "etl_transform": """
 rng = random.Random(seed)
 data = []
 for _ in range(n):
     row = []
-    for _ in range(12):
-        row.append(None if rng.random() < 0.15 else rng.uniform(-5, 5))
+    for _ in range(16):
+        row.append(None if rng.random() < 0.18 else rng.uniform(-5, 5))
     data.append(row)
 return data
 """,
         "dsl_executor": """
 rng = random.Random(seed)
 ops = ["ADD", "SUB", "MUL"]
-return [[f"{rng.choice(ops)}:{rng.randint(1,4)}" for _ in range(18)] for _ in range(n)]
+return [[f"{rng.choice(ops)}:{rng.randint(1,4)}" for _ in range(22)] for _ in range(n)]
+""",
+        "bitset_ops": """
+rng = random.Random(seed)
+return [(rng.getrandbits(48), rng.getrandbits(48)) for _ in range(n)]
+""",
+        "window_stats": """
+rng = random.Random(seed)
+return [[rng.uniform(-20, 20) for _ in range(40)] for _ in range(n)]
+""",
+        "trie_like_lookup": """
+rng = random.Random(seed)
+stems = ["pre", "pro", "post", "prime", "alpha", "beta"]
+return [" ".join(rng.choice(stems) + str(rng.randint(0, 9)) for _ in range(36)) for _ in range(n)]
+""",
+        "schedule_sim": """
+rng = random.Random(seed)
+data = []
+for _ in range(n):
+    cur = 0
+    jobs = []
+    for _ in range(28):
+        cur += rng.randint(0, 3)
+        jobs.append((cur, rng.randint(1, 6)))
+    data.append(jobs)
+return data
 """,
     }
-
-    reference_impl = {
-        "numeric_kernel": """
-out = []
-for row in data:
-    total = 0.0
-    for x in row:
-        fx = float(x)
-        total += fx * fx
-    out.append(total)
-return out
-""",
-        "string_batch": """
-out = []
-for text in data:
-    c = 0
-    for token in text.split():
-        if token == "x":
-            c += 1
-    out.append(c)
-return out
-""",
-        "graph_microkernel": """
-out = []
-for edges in data:
-    s = 0
-    for _dst, w in edges:
-        s += int(w)
-    out.append(s)
-return out
-""",
-        "dp_operator": """
-out = []
-for seq in data:
-    if not seq:
-        out.append(0)
-        continue
-    best = 1
-    cur = 1
-    prev = seq[0]
-    for v in seq[1:]:
-        if v >= prev:
-            cur += 1
-        else:
-            cur = 1
-        if cur > best:
-            best = cur
-        prev = v
-    out.append(best)
-return out
-""",
-        "geometry_batch": """
-out = []
-for (x1, y1), (x2, y2) in data:
-    out.append(abs(float(x1) - float(x2)) + abs(float(y1) - float(y2)))
-return out
-""",
-        "prob_sampling": """
-out = []
-for row in data:
-    s = 0.0
-    for x in row:
-        s += float(x)
-    if s <= 0.0:
-        out.append([0.0 for _ in row])
-    else:
-        out.append([float(x) / s for x in row])
-return out
-""",
-        "etl_transform": """
-out = []
-for row in data:
-    vals = [float(x) for x in row if x is not None]
-    if not vals:
-        out.append([0.0 for _ in row])
-        continue
-    mean = sum(vals) / len(vals)
-    var = sum((v - mean) * (v - mean) for v in vals) / len(vals)
-    std = (var ** 0.5) if var > 0 else 1.0
-    out.append([0.0 if x is None else (float(x) - mean) / std for x in row])
-return out
-""",
-        "dsl_executor": """
-out = []
-for prog in data:
-    acc = 0
-    for ins in prog:
-        op, val = ins.split(':')
-        v = int(val)
-        if op == 'ADD':
-            acc += v
-        elif op == 'SUB':
-            acc -= v
-        elif op == 'MUL':
-            acc *= v
-    out.append(acc)
-return out
-""",
-    }
-    return _eval_template(family, alpha, dataset_builders[family], reference_impl[family])
+    return _eval_template(family, alpha, dataset_builders[family], build_task_py(family).split("\n", 6)[6])
 
 
 def build_app_files(family: str, difficulty: str) -> Dict[str, str]:
@@ -499,7 +505,7 @@ def generate_records(count: int, seed: int) -> List[TaskRecord]:
             app_files=build_app_files(family, difficulty),
         )
 
-        if any(jaccard_ngrams(rec.instruction, prev.instruction) > 0.88 for prev in records):
+        if any(jaccard_ngrams(rec.instruction, prev.instruction) > 0.90 for prev in records):
             family = rng.choice(families)
             instruction = build_instruction(family, difficulty, rng)
             rec = TaskRecord(
@@ -530,7 +536,7 @@ def to_export_dict(record: TaskRecord) -> Dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate synthetic agent-training tasks.")
-    parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--count", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=Path, default=Path("artifacts/synthetic_tasks.jsonl"))
     args = parser.parse_args()
