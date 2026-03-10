@@ -11,6 +11,6 @@ python3 src/generate_synthetic_tasks.py --count 200 --seed 7 --out artifacts/tas
 Each JSONL line contains:
 - `instruction`
 - `validation_spec`
-- `app_files` (includes concrete `/app/task.py` and `/app/eval.py` contents)
+- `app_files` (contains family-aligned `/app/task.py` and `/app/eval.py`)
 
 plus metadata fields (`id`, `family`, `difficulty`, `tags`) for dataset management.

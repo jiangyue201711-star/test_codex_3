@@ -5,11 +5,6 @@ Each output record contains:
 - instruction
 - validation_spec
 - app_files: {"/app/task.py": ..., "/app/eval.py": ...}
-
-The generator enforces:
-- family/difficulty diversity
-- anti-contamination keyword filtering
-- basic semantic deduplication by n-gram Jaccard
 """
 
 from __future__ import annotations
@@ -18,11 +13,11 @@ import argparse
 import json
 import random
 import re
+import textwrap
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
-
 
 BANNED_KEYWORDS = {
     "dominant eigenvalue",
@@ -34,52 +29,52 @@ BANNED_KEYWORDS = {
 
 FAMILIES = {
     "numeric_kernel": {
-        "goal": "Optimize a numerical kernel function while preserving tolerance-bound outputs.",
-        "io": "Input is a batch of float64 arrays; output is per-item scalar statistics.",
-        "pitfalls": ["catastrophic cancellation", "branch-heavy loops", "temporary allocations"],
+        "goal": "Optimize batched sum-of-squares with float tolerance.",
+        "io": "Input is List[List[float]], output is List[float] of sum(x*x).",
         "kind": "numeric",
+        "pitfalls": ["temporary allocations", "python loop overhead", "floating-point drift"],
     },
     "string_batch": {
-        "goal": "Accelerate batch string/byte processing with exact matching semantics.",
-        "io": "Input is a list of strings and tokens; output is per-token counts.",
-        "pitfalls": ["quadratic scanning", "encoding edge-cases", "large intermediate objects"],
+        "goal": "Accelerate token-frequency counting over string batches.",
+        "io": "Input is List[str], output is List[int] where each item counts token occurrences.",
         "kind": "discrete",
+        "pitfalls": ["quadratic scanning", "edge punctuation", "repeated splitting"],
     },
     "graph_microkernel": {
-        "goal": "Optimize a small graph propagation/counting micro-kernel.",
-        "io": "Input is compact adjacency list; output is per-node weighted degree proxy.",
-        "pitfalls": ["sparse-dense conversion", "index bounds", "duplicate edge handling"],
+        "goal": "Optimize weighted out-degree computation from adjacency lists.",
+        "io": "Input is List[List[Tuple[int,int]]], output is List[int] weighted sums.",
         "kind": "numeric",
+        "pitfalls": ["index bounds", "duplicate edges", "branch-heavy loops"],
     },
     "dp_operator": {
-        "goal": "Improve throughput of a bounded dynamic-programming operator.",
-        "io": "Input is short integer sequences; output is longest non-decreasing run length.",
-        "pitfalls": ["state explosion", "poor cache locality", "incorrect base-case handling"],
+        "goal": "Improve throughput for longest non-decreasing run per sequence.",
+        "io": "Input is List[List[int]], output is List[int] run lengths.",
         "kind": "discrete",
+        "pitfalls": ["base-case handling", "state reset bugs", "empty sequence edge"],
     },
     "geometry_batch": {
-        "goal": "Optimize batched geometric predicate computation.",
-        "io": "Input is point pairs; output is Euclidean distance summaries.",
-        "pitfalls": ["floating-point tolerance", "degenerate geometry", "O(n^2) checks"],
+        "goal": "Optimize batched Manhattan distance computation.",
+        "io": "Input is List[Tuple[Tuple[float,float],Tuple[float,float]]], output is List[float].",
         "kind": "numeric",
+        "pitfalls": ["coordinate unpacking overhead", "degenerate points", "precision tolerance"],
     },
     "prob_sampling": {
-        "goal": "Optimize a probabilistic normalization/evaluation step.",
-        "io": "Input is non-negative score vectors; output is normalized vectors.",
-        "pitfalls": ["normalization drift", "seed misuse", "biased sampling shortcuts"],
+        "goal": "Optimize probability normalization for non-negative vectors.",
+        "io": "Input is List[List[float]], output is List[List[float]] normalized rows.",
         "kind": "numeric",
+        "pitfalls": ["divide-by-zero", "drift from sum=1", "unnecessary copies"],
     },
     "etl_transform": {
-        "goal": "Accelerate ETL-style normalization and feature transformation.",
-        "io": "Input is numeric table with missing values; output is z-score-like normalization.",
-        "pitfalls": ["datetime parsing cost", "null handling", "type instability"],
+        "goal": "Accelerate missing-aware standardization.",
+        "io": "Input is List[List[float|None]], output is standardized List[List[float]].",
         "kind": "numeric",
+        "pitfalls": ["null handling", "repeated aggregation", "unstable variance"],
     },
     "dsl_executor": {
-        "goal": "Optimize execution of a tiny fixed-grammar DSL interpreter core.",
-        "io": "Input is op string list; output is accumulator trajectory checksum.",
-        "pitfalls": ["dispatch overhead", "state mutation bugs", "unchecked opcode paths"],
+        "goal": "Optimize simple DSL accumulator execution.",
+        "io": "Input is List[List[str]], output is List[int] final accumulator values.",
         "kind": "discrete",
+        "pitfalls": ["dispatch overhead", "opcode parsing", "state mutation bugs"],
     },
 }
 
@@ -89,7 +84,6 @@ DIFFICULTY = {
     "L3": {"alpha": 0.90, "seeds": 4, "hidden_tests": 16},
     "L4": {"alpha": 0.85, "seeds": 5, "hidden_tests": 20},
 }
-
 TARGET_RATIO = [("L1", 2), ("L2", 4), ("L3", 3), ("L4", 1)]
 
 
@@ -108,142 +102,349 @@ def build_instruction(family: str, difficulty: str, rng: random.Random) -> str:
     pitfalls = ", ".join(rng.sample(profile["pitfalls"], k=2))
     return (
         f"You are given a partially implemented function in /app/task.py. "
-        f"Goal: {profile['goal']} "
-        f"Difficulty: {difficulty}. "
-        f"I/O contract: {profile['io']} "
+        f"Family: {family}. Goal: {profile['goal']} "
+        f"Difficulty: {difficulty}. I/O contract: {profile['io']} "
         "Keep public function signatures unchanged. You may modify only /app/task.py. "
-        "Do not change /app/eval.py or test harness files. "
-        "Your solution must pass correctness checks and beat the reference implementation "
-        "on median runtime. "
+        "Do not change /app/eval.py. Your solution must pass correctness checks and "
+        "beat the reference implementation on median runtime. "
         f"Pay special attention to: {pitfalls}."
     )
 
 
 def build_validation_spec(family: str, difficulty: str, rng: random.Random) -> Dict:
     d = DIFFICULTY[difficulty]
+    numeric = FAMILIES[family]["kind"] == "numeric"
     return {
         "correctness": {
             "deterministic_tests": 24 + 4 * (difficulty in {"L3", "L4"}),
             "randomized_tests": 32 + 8 * (difficulty in {"L3", "L4"}),
-            "numeric_tolerance": {
-                "abs_err": 1e-8 if FAMILIES[family]["kind"] == "numeric" else 0.0,
-                "rel_err": 1e-6 if FAMILIES[family]["kind"] == "numeric" else 0.0,
-            },
-            "property_checks": [
-                "shape and dtype invariants",
-                "edge-case behavior on empty/minimal inputs",
-                "stability under repeated calls with same seed",
-            ],
+            "numeric_tolerance": {"abs_err": 1e-8 if numeric else 0.0, "rel_err": 1e-6 if numeric else 0.0},
         },
         "performance": {
             "metric": "median_time_per_call",
             "warmup_calls": 20,
             "timed_calls": 120,
             "pass_condition": f"candidate_median <= {d['alpha']} * reference_median",
-            "max_single_case_timeout_ms": 200,
         },
         "robustness": {
             "seeds": [rng.randint(1, 10_000_000) for _ in range(d["seeds"])],
-            "distribution_shift_tests": True,
             "hidden_tests": d["hidden_tests"],
         },
-        "anti_cheat": {
-            "disallow_eval_introspection": True,
-            "shuffle_input_order": True,
-            "randomize_lengths": True,
-        },
+        "anti_cheat": {"disallow_eval_introspection": True, "shuffle_input_order": True},
     }
+
+
+def _task_template(family: str, body: str) -> str:
+    body_i = textwrap.indent(textwrap.dedent(body).strip(), "    ")
+    return (
+        f'"""Auto-generated task starter for family: {family}."""\n'
+        'from __future__ import annotations\n\n'
+        f'FAMILY = "{family}"\n\n'
+        'def solve(data):\n'
+        '    """TODO: optimize while preserving exact output semantics."""\n'
+        f"{body_i}\n"
+    )
+
+
+def _eval_template(family: str, alpha: float, dataset_fn: str, reference_fn: str) -> str:
+    dataset_i = textwrap.indent(textwrap.dedent(dataset_fn).strip(), "    ")
+    reference_i = textwrap.indent(textwrap.dedent(reference_fn).strip(), "    ")
+    return (
+        f'"""Auto-generated evaluator for family: {family}."""\n'
+        'from __future__ import annotations\n\n'
+        'import random\nimport statistics\nimport time\n\n'
+        f'FAMILY = "{family}"\n\n'
+        'def build_dataset(seed: int, n: int = 120):\n'
+        f"{dataset_i}\n\n"
+        'def reference_solve(data):\n'
+        f"{reference_i}\n\n"
+        'def check_correctness(candidate_fn, seed: int = 0):\n'
+        '    data = build_dataset(seed)\n'
+        '    ref = reference_solve(data)\n'
+        '    got = candidate_fn(data)\n'
+        '    if len(ref) != len(got):\n'
+        '        return False\n'
+        '    for a, b in zip(ref, got):\n'
+        '        if isinstance(a, float):\n'
+        '            if abs(a - b) > 1e-8:\n'
+        '                return False\n'
+        '        elif isinstance(a, list):\n'
+        '            if len(a) != len(b):\n'
+        '                return False\n'
+        '            for x, y in zip(a, b):\n'
+        '                if abs(x - y) > 1e-8:\n'
+        '                    return False\n'
+        '        else:\n'
+        '            if a != b:\n'
+        '                return False\n'
+        '    return True\n\n'
+        'def median_runtime(fn, seed: int = 0, repeats: int = 80):\n'
+        '    data = build_dataset(seed)\n'
+        '    costs = []\n'
+        '    for _ in range(repeats):\n'
+        '        t0 = time.perf_counter()\n'
+        '        fn(data)\n'
+        '        costs.append(time.perf_counter() - t0)\n'
+        '    return statistics.median(costs)\n\n'
+        'def evaluate(candidate_fn):\n'
+        '    if not check_correctness(candidate_fn, seed=7):\n'
+        '        return {"passed": False, "reason": "correctness", "family": FAMILY}\n'
+        '    c = median_runtime(candidate_fn, seed=11)\n'
+        '    r = median_runtime(reference_solve, seed=11)\n'
+        f'    return {{"passed": bool(c <= {alpha} * r), "candidate": c, "reference": r, "alpha": {alpha}, "family": FAMILY}}\n'
+    )
 
 
 def build_task_py(family: str) -> str:
-    return f'''"""Auto-generated starter for family: {family}."""
-
-from __future__ import annotations
-
-
-def solve(data):
-    """TODO: optimize this implementation in-place.
-
-    Constraints:
-    - keep function signature unchanged
-    - keep return type stable
-    """
-    # Slow baseline (intentionally loop-heavy)
-    out = []
-    for item in data:
-        if isinstance(item, (list, tuple)):
-            s = 0.0
-            for x in item:
-                s += float(x)
-            out.append(s)
-        elif isinstance(item, str):
-            out.append(float(len(item.split())))
+    task_bodies = {
+        "numeric_kernel": """
+out = []
+for row in data:
+    s = 0.0
+    for x in row:
+        fx = float(x)
+        s += fx * fx
+    out.append(s)
+return out
+""",
+        "string_batch": """
+out = []
+for text in data:
+    cnt = 0
+    for token in text.split():
+        if token == "x":
+            cnt += 1
+    out.append(cnt)
+return out
+""",
+        "graph_microkernel": """
+out = []
+for edges in data:
+    total = 0
+    for _dst, w in edges:
+        total += int(w)
+    out.append(total)
+return out
+""",
+        "dp_operator": """
+out = []
+for seq in data:
+    if not seq:
+        out.append(0)
+        continue
+    best = 1
+    cur = 1
+    prev = seq[0]
+    for v in seq[1:]:
+        if v >= prev:
+            cur += 1
         else:
-            out.append(float(item) if item is not None else 0.0)
-    return out
-'''
+            cur = 1
+        if cur > best:
+            best = cur
+        prev = v
+    out.append(best)
+return out
+""",
+        "geometry_batch": """
+out = []
+for (x1, y1), (x2, y2) in data:
+    out.append(abs(float(x1) - float(x2)) + abs(float(y1) - float(y2)))
+return out
+""",
+        "prob_sampling": """
+out = []
+for row in data:
+    total = 0.0
+    for x in row:
+        total += float(x)
+    if total <= 0.0:
+        out.append([0.0 for _ in row])
+    else:
+        out.append([float(x) / total for x in row])
+return out
+""",
+        "etl_transform": """
+out = []
+for row in data:
+    vals = [float(x) for x in row if x is not None]
+    if not vals:
+        out.append([0.0 for _ in row])
+        continue
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) * (v - mean) for v in vals) / len(vals)
+    std = (var ** 0.5) if var > 0 else 1.0
+    out.append([0.0 if x is None else (float(x) - mean) / std for x in row])
+return out
+""",
+        "dsl_executor": """
+out = []
+for prog in data:
+    acc = 0
+    for ins in prog:
+        op, val = ins.split(':')
+        v = int(val)
+        if op == 'ADD':
+            acc += v
+        elif op == 'SUB':
+            acc -= v
+        elif op == 'MUL':
+            acc *= v
+    out.append(acc)
+return out
+""",
+    }
+    return _task_template(family, task_bodies[family])
 
 
-def build_eval_py(difficulty: str) -> str:
+def build_eval_py(family: str, difficulty: str) -> str:
     alpha = DIFFICULTY[difficulty]["alpha"]
-    return f'''"""Auto-generated evaluator template."""
+    dataset_builders = {
+        "numeric_kernel": """
+rng = random.Random(seed)
+return [[rng.uniform(-3, 3) for _ in range(32)] for _ in range(n)]
+""",
+        "string_batch": """
+rng = random.Random(seed)
+vocab = ["x", "a", "b", "c", "d"]
+return [" ".join(rng.choice(vocab) for _ in range(40)) for _ in range(n)]
+""",
+        "graph_microkernel": """
+rng = random.Random(seed)
+return [[(rng.randint(0, 31), rng.randint(1, 8)) for _ in range(24)] for _ in range(n)]
+""",
+        "dp_operator": """
+rng = random.Random(seed)
+return [[rng.randint(0, 20) for _ in range(48)] for _ in range(n)]
+""",
+        "geometry_batch": """
+rng = random.Random(seed)
+return [((rng.uniform(-10, 10), rng.uniform(-10, 10)), (rng.uniform(-10, 10), rng.uniform(-10, 10))) for _ in range(n)]
+""",
+        "prob_sampling": """
+rng = random.Random(seed)
+return [[rng.random() for _ in range(16)] for _ in range(n)]
+""",
+        "etl_transform": """
+rng = random.Random(seed)
+data = []
+for _ in range(n):
+    row = []
+    for _ in range(12):
+        row.append(None if rng.random() < 0.15 else rng.uniform(-5, 5))
+    data.append(row)
+return data
+""",
+        "dsl_executor": """
+rng = random.Random(seed)
+ops = ["ADD", "SUB", "MUL"]
+return [[f"{rng.choice(ops)}:{rng.randint(1,4)}" for _ in range(18)] for _ in range(n)]
+""",
+    }
 
-from __future__ import annotations
-
-import statistics
-import time
-
-
-def reference_solve(data):
-    # Deliberately simple and usually slower than an optimized vectorized solution.
-    out = []
-    for item in data:
-        if isinstance(item, (list, tuple)):
-            total = 0.0
-            for x in item:
-                total += float(x)
-            out.append(total)
-        elif isinstance(item, str):
-            out.append(float(len(item.split())))
+    reference_impl = {
+        "numeric_kernel": """
+out = []
+for row in data:
+    total = 0.0
+    for x in row:
+        fx = float(x)
+        total += fx * fx
+    out.append(total)
+return out
+""",
+        "string_batch": """
+out = []
+for text in data:
+    c = 0
+    for token in text.split():
+        if token == "x":
+            c += 1
+    out.append(c)
+return out
+""",
+        "graph_microkernel": """
+out = []
+for edges in data:
+    s = 0
+    for _dst, w in edges:
+        s += int(w)
+    out.append(s)
+return out
+""",
+        "dp_operator": """
+out = []
+for seq in data:
+    if not seq:
+        out.append(0)
+        continue
+    best = 1
+    cur = 1
+    prev = seq[0]
+    for v in seq[1:]:
+        if v >= prev:
+            cur += 1
         else:
-            out.append(float(item) if item is not None else 0.0)
-    return out
-
-
-def check_correctness(candidate_fn, dataset):
-    ref = reference_solve(dataset)
-    got = candidate_fn(dataset)
-    if len(ref) != len(got):
-        return False
-    return all(abs(a - b) <= 1e-8 for a, b in zip(ref, got))
-
-
-def median_runtime(fn, dataset, repeats=80):
-    costs = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        fn(dataset)
-        costs.append(time.perf_counter() - t0)
-    return statistics.median(costs)
-
-
-def evaluate(candidate_fn, dataset):
-    ok = check_correctness(candidate_fn, dataset)
-    if not ok:
-        return {{"passed": False, "reason": "correctness"}}
-
-    c = median_runtime(candidate_fn, dataset)
-    r = median_runtime(reference_solve, dataset)
-    perf_ok = c <= {alpha} * r
-    return {{"passed": bool(perf_ok), "candidate": c, "reference": r, "alpha": {alpha}}}
-'''
+            cur = 1
+        if cur > best:
+            best = cur
+        prev = v
+    out.append(best)
+return out
+""",
+        "geometry_batch": """
+out = []
+for (x1, y1), (x2, y2) in data:
+    out.append(abs(float(x1) - float(x2)) + abs(float(y1) - float(y2)))
+return out
+""",
+        "prob_sampling": """
+out = []
+for row in data:
+    s = 0.0
+    for x in row:
+        s += float(x)
+    if s <= 0.0:
+        out.append([0.0 for _ in row])
+    else:
+        out.append([float(x) / s for x in row])
+return out
+""",
+        "etl_transform": """
+out = []
+for row in data:
+    vals = [float(x) for x in row if x is not None]
+    if not vals:
+        out.append([0.0 for _ in row])
+        continue
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) * (v - mean) for v in vals) / len(vals)
+    std = (var ** 0.5) if var > 0 else 1.0
+    out.append([0.0 if x is None else (float(x) - mean) / std for x in row])
+return out
+""",
+        "dsl_executor": """
+out = []
+for prog in data:
+    acc = 0
+    for ins in prog:
+        op, val = ins.split(':')
+        v = int(val)
+        if op == 'ADD':
+            acc += v
+        elif op == 'SUB':
+            acc -= v
+        elif op == 'MUL':
+            acc *= v
+    out.append(acc)
+return out
+""",
+    }
+    return _eval_template(family, alpha, dataset_builders[family], reference_impl[family])
 
 
 def build_app_files(family: str, difficulty: str) -> Dict[str, str]:
-    return {
-        "/app/task.py": build_task_py(family),
-        "/app/eval.py": build_eval_py(difficulty),
-    }
+    return {"/app/task.py": build_task_py(family), "/app/eval.py": build_eval_py(family, difficulty)}
 
 
 def contains_banned_phrase(text: str) -> bool:
